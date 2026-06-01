@@ -78,19 +78,20 @@ class ResumeTailorRequest(BaseModel):
 
 
 class TailoredExperience(BaseModel):
-    title: str
-    company: str
-    start_date: str
-    end_date: str
-    bullets: list[str]
+    title: str = ""
+    company: str = ""
+    start_date: str = ""
+    end_date: str = ""
+    description: str = ""
+    bullets: list[str] = []
 
 
 class ResumeObject(BaseModel):
-    personal_info: PersonalInfo
-    summary: str
-    experience: list[TailoredExperience]
-    education: list[Education]
-    skills: list[str]
+    personal_info: PersonalInfo = PersonalInfo()
+    summary: str = ""
+    experience: list[TailoredExperience] = []
+    education: list[Education] = []
+    skills: list[str] = []
 
 
 class ResumeTailorResponse(BaseModel):
