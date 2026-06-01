@@ -1,4 +1,5 @@
 import os
+import re
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -18,7 +19,6 @@ frontend_url = os.getenv("FRONTEND_URL", "")
 allowed_origins = [
     "http://localhost:3000",
     "http://localhost:5173",
-    "https://id-preview--81796cfb-0ef6-475d-b9d2-9ee95d8f0c8a.lovable.app",
 ]
 if frontend_url:
     allowed_origins.append(frontend_url)
@@ -26,6 +26,7 @@ if frontend_url:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins,
+    allow_origin_regex=r"https://.*.lovable(?:project)?\.(?:app|com)",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
