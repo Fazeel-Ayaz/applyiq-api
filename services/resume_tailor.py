@@ -94,7 +94,7 @@ Return a JSON object with exactly this structure:
 Populate personal_info from the candidate profile. Return ONLY the JSON object."""
 
     message = await client.messages.create(
-        model="claude-sonnet-4-20250514",
+        model="claude-sonnet-4-5",
         max_tokens=4096,
         messages=[{"role": "user", "content": prompt}],
     )
