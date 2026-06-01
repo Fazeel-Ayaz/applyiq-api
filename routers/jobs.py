@@ -33,10 +33,7 @@ async def search_jobs_endpoint(req: JobSearchRequest):
             detail={"error": "Job search API error", "detail": str(e)},
         )
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail={"error": "Job search failed", "detail": str(e)},
-        )
+    raise HTTPException(status_code=500, detail={"error": "Job search failed", "detail": str(e)})
 
 
 @router.post("/search-by-url", response_model=JobObject)
