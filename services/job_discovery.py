@@ -1,170 +1,278 @@
 import os
-import hashlib
 import httpx
+from typing import Optional
 from models import JobObject
 
+JSEARCH_API_KEY = os.getenv("JSEARCH_API_KEY")
+ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID")
+ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY")
+MUSE_API_KEY = os.getenv("MUSE_API_KEY")
 
-JSEARCH_BASE = "https://jsearch.p.rapidapi.com"
+JSEARCH_BASE = "https://jsearch.p.rapidapi.com/search"
 ADZUNA_BASE = "https://api.adzuna.com/v1/api/jobs"
-MUSE_BASE = "https://www.themuse.com/api/public"
+MUSE_BASE = "https://www.themuse.com/api/public/jobs"
+
+# Maps experience level into natural language query terms
+# JSearch does not have a seniority filter — we fold it into the query string
+EXPERIENCE_QUERY_MAP = {
+    "entry": "junior entry-level",
+    "mid": "mid-level",
+    "senior": "senior",
+    "lead": "lead principal",
+    "any": "",
+}
+
+# Maps country names to Adzuna country codes
+ADZUNA_COUNTRY_MAP = {
+    "united states": "us",
+    "usa": "us",
+    "us": "us",
+    "united kingdom": "gb",
+    "uk": "gb",
+    "gb": "gb",
+    "australia": "au",
+    "canada": "ca",
+    "germany": "de",
+    "france": "fr",
+    "india": "in",
+    "brazil": "br",
+    "netherlands": "nl",
+    "new zealand": "nz",
+    "singapore": "sg",
+    "south africa": "za",
+    "poland": "pl",
+    "russia": "ru",
+    "united arab emirates": "ae",
+    "uae": "ae",
+}
 
 
-def _make_job_id(company: str, title: str) -> str:
-    raw = f"{company.lower().strip()}|{title.lower().strip()}"
-    return hashlib.md5(raw.encode()).hexdigest()[:12]
+def _dedup(jobs: list[dict]) -> list[dict]:
+    """Deduplicate jobs by (company, title) pair, keeping first occurrence."""
+    seen = set()
+    result = []
+    for job in jobs:
+        key = (job.get("company", "").lower().strip(), job.get("title", "").lower().strip())
+        if key not in seen:
+            seen.add(key)
+            result.append(job)
+    return result
+
+
+async def _enrich_with_muse(jobs: list[dict]) -> list[dict]:
+    """
+    Enrich jobs with The Muse company culture data where available.
+    Matches by company name. Silently skips if Muse API is unavailable.
+    """
+    if not MUSE_API_KEY:
+        return jobs
+
+    company_names = list({j.get("company", "") for j in jobs if j.get("company")})
+    muse_data: dict[str, dict] = {}
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        for company in company_names[:10]:  # cap at 10 to avoid rate limits
+            try:
+                resp = await client.get(
+                    MUSE_BASE,
+                    params={"company": company, "api_key": MUSE_API_KEY, "page": 1},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    results = data.get("results", [])
+                    if results:
+                        muse_data[company.lower()] = {
+                            "culture_summary": results[0].get("contents", "")[:300],
+                            "muse_url": results[0].get("refs", {}).get("landing_page", ""),
+                        }
+            except Exception:
+                continue  # silently skip on any error
+
+    for job in jobs:
+        company_key = job.get("company", "").lower()
+        if company_key in muse_data:
+            job["muse_culture_data"] = muse_data[company_key]
+
+    return jobs
 
 
 async def search_jsearch(
     keywords: str,
     location: str,
-    remote_only: bool,
-    experience_level: str,
-    limit: int,
+    experience_level: str = "any",
+    remote_only: bool = False,
+    limit: int = 10,
 ) -> list[dict]:
-    api_key = os.getenv("JSEARCH_API_KEY", "")
-    if not api_key:
+    """
+    Search jobs via JSearch (RapidAPI).
+    experience_level is folded into the query string — NOT sent as employment_types.
+    employment_types is a job-type filter (FULLTIME/PARTTIME), not a seniority filter.
+    """
+    if not JSEARCH_API_KEY:
         return []
 
+    experience_term = EXPERIENCE_QUERY_MAP.get(experience_level.lower(), "")
+    query_parts = [keywords]
+    if experience_term:
+        query_parts.append(experience_term)
+    if location:
+        query_parts.append(f"in {location}")
+    query = " ".join(query_parts).strip()
+
     params = {
-        "query": f"{keywords} in {location}" if location else keywords,
-        "num_pages": "1",
-        "page": "1",
+        "query": query,
+        "num_pages": 1,
+        "page": 1,
+        "employment_types": "FULLTIME",  # always request full-time roles
     }
+
     if remote_only:
         params["remote_jobs_only"] = "true"
-    if experience_level:
-        params["employment_types"] = experience_level
 
     headers = {
-        "X-RapidAPI-Key": api_key,
+        "X-RapidAPI-Key": JSEARCH_API_KEY,
         "X-RapidAPI-Host": "jsearch.p.rapidapi.com",
     }
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(f"{JSEARCH_BASE}/search", headers=headers, params=params)
-        resp.raise_for_status()
-        data = resp.json().get("data", [])
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(JSEARCH_BASE, params=params, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            raw_jobs = data.get("data", [])
+    except Exception:
+        return []
 
-    results = []
-    for item in data[:limit]:
-        results.append({
-            "title": item.get("job_title", ""),
-            "company": item.get("employer_name", ""),
-            "location": item.get("job_city", "") or item.get("job_country", ""),
-            "url": item.get("job_apply_link", "") or item.get("job_google_link", ""),
-            "description": item.get("job_description", ""),
-            "source": "jsearch",
-        })
-    return results
+    jobs = []
+    for job in raw_jobs[:limit]:
+        jobs.append(
+            {
+                "id": job.get("job_id", ""),
+                "title": job.get("job_title", ""),
+                "company": job.get("employer_name", ""),
+                "location": f"{job.get('job_city', '')} {job.get('job_country', '')}".strip(),
+                "url": job.get("job_apply_link", ""),
+                "description": job.get("job_description", "")[:2000],
+                "source": "jsearch",
+            }
+        )
+
+    return jobs
 
 
 async def search_adzuna(
     keywords: str,
     location: str,
-    limit: int,
+    experience_level: str = "any",
+    remote_only: bool = False,
+    limit: int = 10,
 ) -> list[dict]:
-    app_id = os.getenv("ADZUNA_APP_ID", "")
-    app_key = os.getenv("ADZUNA_APP_KEY", "")
-    if not app_id or not app_key:
+    """
+    Search jobs via Adzuna API.
+    Falls back gracefully if country code not found or API unavailable.
+    """
+    if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
         return []
 
-    country = "us"
+    # Adzuna requires a country code in the URL path
+    country_code = ADZUNA_COUNTRY_MAP.get(location.lower().strip(), "us")
+
+    # Fold experience level into query string
+    experience_term = EXPERIENCE_QUERY_MAP.get(experience_level.lower(), "")
+    query_parts = [keywords]
+    if experience_term:
+        query_parts.append(experience_term)
+    query = " ".join(query_parts).strip()
+
     params = {
-        "app_id": app_id,
-        "app_key": app_key,
-        "what": keywords,
-        "results_per_page": str(limit),
+        "app_id": ADZUNA_APP_ID,
+        "app_key": ADZUNA_APP_KEY,
+        "what": query,
+        "results_per_page": limit,
+        "page": 1,
         "content-type": "application/json",
     }
+
     if location:
         params["where"] = location
 
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(
-            f"{ADZUNA_BASE}/{country}/search/1", params=params
-        )
-        resp.raise_for_status()
-        data = resp.json().get("results", [])
+    if remote_only:
+        params["what"] = f"{query} remote"
 
-    results = []
-    for item in data:
-        results.append({
-            "title": item.get("title", ""),
-            "company": item.get("company", {}).get("display_name", ""),
-            "location": item.get("location", {}).get("display_name", ""),
-            "url": item.get("redirect_url", ""),
-            "description": item.get("description", ""),
-            "source": "adzuna",
-        })
-    return results
+    url = f"{ADZUNA_BASE}/{country_code}/search/1"
 
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            raw_jobs = data.get("results", [])
+    except Exception:
+        return []
 
-async def enrich_with_muse(company_name: str) -> dict | None:
-    api_key = os.getenv("MUSE_API_KEY", "")
-    params = {"company": company_name, "page": "1"}
-    if api_key:
-        params["api_key"] = api_key
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        try:
-            resp = await client.get(f"{MUSE_BASE}/companies", params=params)
-            if resp.status_code != 200:
-                return None
-            results = resp.json().get("results", [])
-            if not results:
-                return None
-            company = results[0]
-            return {
-                "name": company.get("name"),
-                "description": company.get("short_name", ""),
-                "industries": [i.get("name") for i in company.get("industries", [])],
-                "locations": [l.get("name") for l in company.get("locations", [])],
-                "size": company.get("size", {}).get("name", ""),
+    jobs = []
+    for job in raw_jobs[:limit]:
+        jobs.append(
+            {
+                "id": job.get("id", ""),
+                "title": job.get("title", ""),
+                "company": job.get("company", {}).get("display_name", ""),
+                "location": job.get("location", {}).get("display_name", ""),
+                "url": job.get("redirect_url", ""),
+                "description": job.get("description", "")[:2000],
+                "source": "adzuna",
             }
-        except Exception:
-            return None
+        )
 
-
-def deduplicate_jobs(jobs: list[dict]) -> list[dict]:
-    seen = set()
-    unique = []
-    for job in jobs:
-        key = (job["company"].lower().strip(), job["title"].lower().strip())
-        if key not in seen:
-            seen.add(key)
-            unique.append(job)
-    return unique
+    return jobs
 
 
 async def search_jobs(
     keywords: str,
     location: str,
-    remote_only: bool,
-    experience_level: str,
-    limit: int,
+    remote_only: bool = False,
+    experience_level: str = "any",
+    limit: int = 15,
 ) -> list[JobObject]:
-    jsearch_results = await search_jsearch(keywords, location, remote_only, experience_level, limit)
-    adzuna_results = await search_adzuna(keywords, location, limit)
+    """
+    Main job discovery function.
+    Queries JSearch first, falls back to Adzuna, deduplicates, enriches with Muse.
+    """
+    jsearch_jobs = await search_jsearch(
+        keywords=keywords,
+        location=location,
+        experience_level=experience_level,
+        remote_only=remote_only,
+        limit=limit,
+    )
 
-    combined = jsearch_results + adzuna_results
-    unique = deduplicate_jobs(combined)[:limit]
+    adzuna_jobs = await search_adzuna(
+        keywords=keywords,
+        location=location,
+        experience_level=experience_level,
+        remote_only=remote_only,
+        limit=limit,
+    )
 
-    enriched_companies: dict[str, dict | None] = {}
-    jobs = []
-    for item in unique:
-        company = item["company"]
-        if company and company not in enriched_companies:
-            enriched_companies[company] = await enrich_with_muse(company)
+    combined = _dedup(jsearch_jobs + adzuna_jobs)
+    enriched = await _enrich_with_muse(combined)
 
-        jobs.append(JobObject(
-            id=_make_job_id(item["company"], item["title"]),
-            title=item["title"],
-            company=item["company"],
-            location=item["location"],
-            url=item["url"],
-            description=item["description"],
-            source=item["source"],
-            muse_culture_data=enriched_companies.get(company),
-        ))
+    return [JobObject(**job) for job in enriched[:limit]]
 
-    return jobs
+
+async def fetch_job_from_url(url: str) -> dict:
+    """
+    Fetch a job posting from a direct URL.
+    Returns raw HTML text for Claude to extract structured data from.
+    """
+    try:
+        async with httpx.AsyncClient(
+            timeout=15,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; ApplyIQ/1.0)"},
+        ) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            return {"url": url, "html": resp.text[:8000], "status": "ok"}
+    except Exception as e:
+        return {"url": url, "html": "", "status": "error", "error": str(e)}
