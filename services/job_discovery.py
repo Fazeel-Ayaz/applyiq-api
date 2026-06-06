@@ -7,13 +7,14 @@ JSEARCH_API_KEY = os.getenv("JSEARCH_API_KEY")
 ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID")
 ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY")
 MUSE_API_KEY = os.getenv("MUSE_API_KEY")
+SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 
 JSEARCH_BASE = "https://jsearch.p.rapidapi.com/search"
 ADZUNA_BASE = "https://api.adzuna.com/v1/api/jobs"
 MUSE_BASE = "https://www.themuse.com/api/public/jobs"
+SERPER_BASE = "https://google.serper.dev/jobs"
 
 # Maps experience level into natural language query terms
-# JSearch does not have a seniority filter — we fold it into the query string
 EXPERIENCE_QUERY_MAP = {
     "entry": "junior entry-level",
     "mid": "mid-level",
@@ -71,7 +72,7 @@ async def _enrich_with_muse(jobs: list[dict]) -> list[dict]:
     muse_data: dict[str, dict] = {}
 
     async with httpx.AsyncClient(timeout=10) as client:
-        for company in company_names[:10]:  # cap at 10 to avoid rate limits
+        for company in company_names[:10]:
             try:
                 resp = await client.get(
                     MUSE_BASE,
@@ -86,7 +87,7 @@ async def _enrich_with_muse(jobs: list[dict]) -> list[dict]:
                             "muse_url": results[0].get("refs", {}).get("landing_page", ""),
                         }
             except Exception:
-                continue  # silently skip on any error
+                continue
 
     for job in jobs:
         company_key = job.get("company", "").lower()
@@ -103,11 +104,7 @@ async def search_jsearch(
     remote_only: bool = False,
     limit: int = 10,
 ) -> list[dict]:
-    """
-    Search jobs via JSearch (RapidAPI).
-    experience_level is folded into the query string — NOT sent as employment_types.
-    employment_types is a job-type filter (FULLTIME/PARTTIME), not a seniority filter.
-    """
+    """Search jobs via JSearch (RapidAPI)."""
     if not JSEARCH_API_KEY:
         return []
 
@@ -123,7 +120,7 @@ async def search_jsearch(
         "query": query,
         "num_pages": 1,
         "page": 1,
-        "employment_types": "FULLTIME",  # always request full-time roles
+        "employment_types": "FULLTIME",
     }
 
     if remote_only:
@@ -140,7 +137,8 @@ async def search_jsearch(
             resp.raise_for_status()
             data = resp.json()
             raw_jobs = data.get("data", [])
-    except Exception:
+    except Exception as e:
+        print(f"JSearch error: {e}")
         return []
 
     jobs = []
@@ -167,17 +165,12 @@ async def search_adzuna(
     remote_only: bool = False,
     limit: int = 10,
 ) -> list[dict]:
-    """
-    Search jobs via Adzuna API.
-    Falls back gracefully if country code not found or API unavailable.
-    """
+    """Search jobs via Adzuna API."""
     if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
         return []
 
-    # Adzuna requires a country code in the URL path
     country_code = ADZUNA_COUNTRY_MAP.get(location.lower().strip(), "us")
 
-    # Fold experience level into query string
     experience_term = EXPERIENCE_QUERY_MAP.get(experience_level.lower(), "")
     query_parts = [keywords]
     if experience_term:
@@ -207,7 +200,8 @@ async def search_adzuna(
             resp.raise_for_status()
             data = resp.json()
             raw_jobs = data.get("results", [])
-    except Exception:
+    except Exception as e:
+        print(f"Adzuna error: {e}")
         return []
 
     jobs = []
@@ -227,6 +221,95 @@ async def search_adzuna(
     return jobs
 
 
+async def search_serper(
+    keywords: str,
+    location: str,
+    experience_level: str = "any",
+    remote_only: bool = False,
+    limit: int = 10,
+) -> list[dict]:
+    """
+    Search jobs via Serper Google Jobs API.
+    Used as fallback when JSearch + Adzuna return thin results.
+    Excellent coverage for non-English markets (Germany, France, etc.)
+    """
+    if not SERPER_API_KEY:
+        return []
+
+    experience_term = EXPERIENCE_QUERY_MAP.get(experience_level.lower(), "")
+    query_parts = [keywords]
+    if experience_term:
+        query_parts.append(experience_term)
+    if remote_only:
+        query_parts.append("remote")
+    if location:
+        query_parts.append(location)
+    query = " ".join(query_parts).strip()
+
+    headers = {
+        "X-API-KEY": SERPER_API_KEY,
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "q": query,
+        "num": limit,
+    }
+
+    # Add location as gl (country code) if we can map it
+    gl_map = {
+        "germany": "de",
+        "france": "fr",
+        "united kingdom": "gb",
+        "uk": "gb",
+        "united states": "us",
+        "usa": "us",
+        "australia": "au",
+        "canada": "ca",
+        "india": "in",
+        "singapore": "sg",
+        "united arab emirates": "ae",
+        "uae": "ae",
+        "netherlands": "nl",
+        "spain": "es",
+        "italy": "it",
+    }
+    gl = gl_map.get(location.lower().strip())
+    if gl:
+        payload["gl"] = gl
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.post(SERPER_BASE, json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            raw_jobs = data.get("jobs", [])
+    except Exception as e:
+        print(f"Serper error: {e}")
+        return []
+
+    jobs = []
+    for job in raw_jobs[:limit]:
+        import hashlib
+        job_id = hashlib.md5(
+            f"{job.get('companyName', '')}|{job.get('title', '')}".encode()
+        ).hexdigest()[:12]
+
+        jobs.append(
+            {
+                "id": job_id,
+                "title": job.get("title", ""),
+                "company": job.get("companyName", ""),
+                "location": job.get("location", ""),
+                "url": job.get("applyLink", "") or job.get("shareLink", ""),
+                "description": job.get("description", "")[:2000],
+                "source": "serper",
+            }
+        )
+
+    return jobs
+
+
 async def search_jobs(
     keywords: str,
     location: str,
@@ -236,7 +319,8 @@ async def search_jobs(
 ) -> list[JobObject]:
     """
     Main job discovery function.
-    Queries JSearch first, falls back to Adzuna, deduplicates, enriches with Muse.
+    Queries JSearch, Adzuna, and Serper on every search.
+    Deduplicates and enriches with Muse.
     """
     jsearch_jobs = await search_jsearch(
         keywords=keywords,
@@ -254,7 +338,15 @@ async def search_jobs(
         limit=limit,
     )
 
-    combined = _dedup(jsearch_jobs + adzuna_jobs)
+    serper_jobs = await search_serper(
+        keywords=keywords,
+        location=location,
+        experience_level=experience_level,
+        remote_only=remote_only,
+        limit=limit,
+    )
+
+    combined = _dedup(jsearch_jobs + adzuna_jobs + serper_jobs)
     enriched = await _enrich_with_muse(combined)
 
     return [JobObject(**job) for job in enriched[:limit]]
