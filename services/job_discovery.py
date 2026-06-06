@@ -12,7 +12,7 @@ SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 JSEARCH_BASE = "https://jsearch.p.rapidapi.com/search"
 ADZUNA_BASE = "https://api.adzuna.com/v1/api/jobs"
 MUSE_BASE = "https://www.themuse.com/api/public/jobs"
-SERPER_BASE = "https://google.serper.dev/jobs"
+SERPER_BASE = "https://google.serper.dev/search"
 
 # Maps experience level into natural language query terms
 EXPERIENCE_QUERY_MAP = {
@@ -254,6 +254,7 @@ async def search_serper(
     payload = {
         "q": query,
         "num": limit,
+        "type": "jobs",
     }
 
     # Add location as gl (country code) if we can map it
